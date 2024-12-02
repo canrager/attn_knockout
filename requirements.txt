@@ -1,0 +1,12 @@
+# torch==1.12.1
+# transformers==4.27.4
+torch
+transformers
+datasets
+numpy
+pandas
+seaborn
+matplotlib
+nltk
+wget
+# pip install --upgrade git+https://github.com/ndif-team/nnsight.git@0.4
