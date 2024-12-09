@@ -283,8 +283,6 @@ def LlamaAttentionPatcher(
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        print(self.num_key_value_heads)
-        print(f"{query_states.size()=}, {key_states.size()=}, {value_states.size()=}")
         # ---------------------------------------------------------------------
         if save_kqv_for is not None:
             for head_idx, token_idx in save_kqv_for:
