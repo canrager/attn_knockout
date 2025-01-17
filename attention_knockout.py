@@ -8,20 +8,39 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from llama_attention import LlamaAttentionPatcher, AttentionEdge
+from attention_utils import AttentionEdge, AttentionPatcher
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
 
+EPS = 1e-10
 torch.set_grad_enabled(False)
 
 
 def init_model(model_id):
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="cuda:0",
-        torch_dtype=torch.bfloat16,
-        cache_dir="/share/u/can/models",
-    )
+    # TODO clarify handlling of BOS token. It is currently added.
+    if "meta-llama" in model_id:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map="cuda:0",
+            torch_dtype=torch.bfloat16,
+            cache_dir="/share/u/can/models",
+        )
+        model.family_name = "llama"
+    elif "google/gemma" in model_id:
+        # Adding BOS token is necessary for Gemma2
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            device_map="cuda:0",
+            torch_dtype=torch.bfloat16,
+            cache_dir="/share/u/can/models",
+            low_cpu_mem_usage=True,
+            attn_implementation='sdpa', # Does NOT work with `attn_implementation='eager'`
+            # use_cache=False, # Do not use attention KV cache
+        )
+        model.family_name = "gemma"
+    else:
+        raise ValueError(f"Unsupported model: {model_id}. Only meta-llama and google/gemma models are supported.")
+    
     # Save the original forward method for reuse
     model.original_forwards = {}
     for layer in range(model.config.num_hidden_layers):
@@ -33,8 +52,14 @@ def edit_model(model, layer_window, cut_edges):
     for layer in range(model.config.num_hidden_layers):
         attn_block = model.model.layers[layer].self_attn
         if layer in layer_window:
+            # Choose patcher based on model family
+            if model.family_name in ["gemma", "llama"]:
+                patcher = AttentionPatcher
+            else:
+                raise ValueError(f"Unsupported model: {model_id}. Only meta-llama and google/gemma models are supported.")
+
             attn_block.forward = types.MethodType(
-                LlamaAttentionPatcher(
+                patcher(
                     block_name=f"layers.{layer}.self_attn",
                     cut_attn_edges=cut_edges,
                     save_attn_for=None,
@@ -48,39 +73,53 @@ def edit_model(model, layer_window, cut_edges):
     return model
 
 
-def find_subject_end_position(tokenizer, text, subject):
+def find_subject_positions(tokenizer, text, subject):
     """
-    Find the position of the last token of the subject in the tokenized text.
+    Find all positions where the subject appears in the tokenized text.
+    Returns both the positions and debug info.
     """
-    full_tokens = tokenizer.encode(text, add_special_tokens=False)
+    full_tokens = tokenizer.encode(text, add_special_tokens=True) # Gemma2 does not work for add_special_tokens=False
     subject_tokens = tokenizer.encode(subject, add_special_tokens=False)
 
     full_token_strings = [tokenizer.decode([t]) for t in full_tokens]
     subject_token_strings = [tokenizer.decode([t]) for t in subject_tokens]
 
     subject_length = len(subject_token_strings)
+    subject_positions = []
+    
     for i in range(len(full_token_strings) - subject_length + 1):
-        if full_token_strings[i : i + subject_length] == subject_token_strings:
-            return i + subject_length - 1
+        window = full_token_strings[i : i + subject_length]
+        if ''.join(window).strip() == ''.join(subject_token_strings).strip():
+            subject_positions.append((i, i + subject_length - 1))  # Store start and end positions
 
-    return None
+    if not subject_positions:
+        return None
+    
+    return subject_positions
 
 
-def process_subject_position(model_id, knowns_df):
-
-    # Initialize tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    subject_end_pos = []
-    for item in knowns_df.itertuples():
+def process_subject_position(tokenizer, knowns_df):
+    subject_positions = []
+    
+    for idx, item in enumerate(knowns_df.itertuples()):
         prompt = item.prompt
         subject = item.subject
-        subject_end_pos.append(find_subject_end_position(tokenizer, prompt, subject))
+        positions = find_subject_positions(tokenizer, prompt, subject) # Can be None if not found
+        subject_positions.append(positions)
+    
+    return subject_positions
 
-    return subject_end_pos
+
+def get_correct_pred_id(tokenizer, knowns_df):
+    correct_pred_ids = []
+    for sample in knowns_df.itertuples():
+        correct_pred_str = " " + sample.attribute
+        correct_pred_id = tokenizer.encode(correct_pred_str, add_special_tokens=False)[0] # First token if multiple tokens
+        correct_pred_ids.append(correct_pred_id)
+    return correct_pred_ids
 
 
-def run_llama(model_id, layer_window_size, num_samples=None):
+def run_exp(model_id, layer_window_size, num_samples=None, verbose=False, cut_all_subject_edges=False):
     # Load model and tokenizer
     model = init_model(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -97,7 +136,8 @@ def run_llama(model_id, layer_window_size, num_samples=None):
         knowns_df = knowns_df.head(num_samples)
 
     # Process subject positions
-    subject_end_pos = process_subject_position(model_id, knowns_df)
+    subject_positions = process_subject_position(tokenizer, knowns_df)
+    correct_pred_ids = get_correct_pred_id(tokenizer, knowns_df)
 
     # Define layer windows
     wing = layer_window_size // 2
@@ -107,40 +147,63 @@ def run_llama(model_id, layer_window_size, num_samples=None):
         end = min(i + wing, num_layers - 1)
         window = list(range(start, end + 1))
         windows.append(window)
-    print(f"Selected layer windows:\n{windows}")
 
     # Run the experiment
     base_prob = torch.zeros(num_samples, device=model.device)
     patch_probs = torch.zeros((num_layers, num_samples), device=model.device)
 
     for sample_idx, sample in tqdm(knowns_df.iterrows(), total=num_samples):
+        if subject_positions[sample_idx] is None:
+            print(f"Warning: Could not find subject position for sample {sample_idx}. Skipping...")
+            continue
+       
+        correct_pred_id = correct_pred_ids[sample_idx]
+
         # Tokenize
         input_ids = tokenizer.encode(
-            sample["prompt"], return_tensors="pt", add_special_tokens=False
+            sample["prompt"], return_tensors="pt", add_special_tokens=True
         )
         input_ids = input_ids.to(model.device)
 
         # Get base prediction
         model = edit_model(model, [], {})
-        logits = model(input_ids).logits[0, -1, :]
+        logits = model(input_ids).logits[0, :, :]
+        logits = logits[-1, :]
         probs = torch.softmax(logits, dim=-1)
-        pred_id = torch.argmax(probs)
-        base_prob[sample_idx] = probs[pred_id]
+
+        base_prob[sample_idx] = probs[correct_pred_id]
 
         # Define ablation
-        k_idx = subject_end_pos[sample_idx]
         q_idx = len(input_ids[0]) - 1
-        edges = [AttentionEdge(q_idx=q_idx, k_idx=k_idx)]
+        edges = []
+        
+        if cut_all_subject_edges:
+            # Cut edges from final token to all subject token positions
+            for start_pos, end_pos in subject_positions[sample_idx]:
+                for k_idx in range(start_pos, end_pos + 1):
+                    edges.append(AttentionEdge(q_idx=q_idx, k_idx=k_idx))
+        else:
+            # Original behavior: only cut edge to final subject position
+            k_idx = subject_positions[sample_idx][-1][1]  # Use end position of last occurrence
+            edges = [AttentionEdge(q_idx=q_idx, k_idx=k_idx)]
+
         cut_edges = {i: edges for i in range(model.config.num_attention_heads)}
 
         # Evaluate all windows
         for l, layer_window in enumerate(windows):
             model = edit_model(model, layer_window, cut_edges)
             logits = model(input_ids).logits[0, -1, :]
+                
             probs = torch.softmax(logits, dim=-1)
-            patch_probs[l, sample_idx] = probs[pred_id]
+            patch_probs[l, sample_idx] = probs[correct_pred_id]
 
-    relative_diff = (patch_probs - base_prob) * 100.0 / base_prob
+    # Calculate relative difference with safety checks
+    relative_diff = (patch_probs - base_prob) * 100.0 / (base_prob + EPS)
+
+    # Add logging for debugging
+    num_nans = torch.isnan(relative_diff).sum().item()
+    if num_nans > 0:
+        print(f"Warning: {num_nans} NaN values in results. This can occur if too many edges are cut.")
 
     # Convert tensors to numpy arrays for JSON serialization
     results = {
@@ -233,16 +296,22 @@ def plot_results(results_dict, output_path=None):
         plt.show()
 
 
+def get_model_name(model_id: str) -> str:
+    """Extract a clean model name from model id."""
+    return model_id.split('/')[-1].lower()
+
 
 if __name__ == "__main__":
     # Set experiment parameters here
     model_ids = [
         "meta-llama/Llama-3.2-1B",
-        "meta-llama/Llama-3.2-3B",
-        "meta-llama/Llama-3.1-8B",
+        # "google/gemma-2-9b",
+        "google/gemma-2-2b",
     ]
-    layer_window_sizes = [8, 12, 14]
-    num_samples = [20]*3
+    layer_window_sizes = [4]*2
+    num_samples = [30]*2
+    verbose = True
+    cut_all_subject_edges = True  # New parameter to control edge cutting behavior
 
     assert (
         len(model_ids) == len(layer_window_sizes) == len(num_samples)
@@ -255,21 +324,37 @@ if __name__ == "__main__":
     start_time = time.time()
     for model_id, layer_window_size, num_sample in zip(model_ids, layer_window_sizes, num_samples):
         print(f"\nProcessing {model_id}...")
-        results = run_llama(model_id, layer_window_size=layer_window_size, num_samples=num_sample)
+        results = run_exp(
+            model_id, 
+            layer_window_size=layer_window_size, 
+            num_samples=num_sample, 
+            verbose=verbose,
+            cut_all_subject_edges=cut_all_subject_edges
+        )
         all_results[results["model_name"]] = results
     end_time = time.time()
     print(f"Total time taken: {end_time - start_time:.2f}s")
 
+
+    # Create clean model names string
+    model_names = "_".join([get_model_name(m) for m in model_ids])
+    
     # Save results to JSON
+    results_filename = f"attn_knockout_{model_names}_win{layer_window_sizes[0]}_n{num_samples[0]}.json"
+    
+    # Create output directory if it doesn't exist
+    os.makedirs("results", exist_ok=True)
+    results_path = os.path.join("results", results_filename)
+    
     if all_results:
-        with open("model_results.json", "w") as f:
+        with open(results_path, "w") as f:
             json.dump(all_results, f, indent=2)
     else:
-        all_results = json.load(open("model_results.json"))
-
+        all_results = json.load(open(results_path))
 
     # Plot results
-    plot_results(all_results, output_path="attention_knockout_comparison.png")
+    plot_filename = results_path.replace(".json", ".png")
+    plot_results(all_results, output_path=plot_filename)
 
-    print("\nResults have been saved to 'model_results.json'")
-    print("Plot has been saved to 'attention_knockout_comparison.png'")
+    print(f"\nResults have been saved to '{results_path}'")
+    print(f"Plot has been saved to '{plot_filename}'")

@@ -1,4 +1,6 @@
 *.json
-factual_associations_dissection.ipynb
 *__pycache__/
 *.png
+*.out
+
+*/results/*
